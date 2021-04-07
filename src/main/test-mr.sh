@@ -66,8 +66,8 @@ else
   failed_any=1
 fi
 
-echo '----' thl exit
-exit 1
+#echo '----' thl exit
+#exit 1
 #thl modify
 
 

@@ -20,7 +20,8 @@ const (
 	ReducePhase MasterPhase = 1
 )
 const(
-	MaxTasktime time.Duration = 5 * time.Second
+	MaxTasktime time.Duration = 10 * time.Second
+	ScheTime    time.Duration = 500 * time.Millisecond
 )
 
 type TaskPhase int
@@ -33,7 +34,7 @@ const (
 	Taskerror	TaskPhase = 4
 )
 
-
+///Master的结构
 type Master struct {
 	// Your definitions here.
 	mu             sync.Mutex
@@ -44,9 +45,10 @@ type Master struct {
 	masterphase    MasterPhase  //master工作阶段
 	done           bool         //master完成状态
 	taskchan       chan MRTask  //为什么不用指针
-	wokerseq	   int          ///master分配workerID号
+	wokerseq	   int          ///master为worker分配ID号
 }
 
+//记录任务的状态
 type TaskStatus struct {
 	starttime  time.Time   ///任务的开始时间
 	workerid   int	      ///任务被分配到哪个worker的ID号
@@ -57,7 +59,7 @@ type TaskStatus struct {
 func (m *Master) RegisTask(index int, args *GetOneTaskArgs){
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.taskstatusList[index].workerid  = args.workerid
+	m.taskstatusList[index].workerid  = args.Workerid
 	m.taskstatusList[index].starttime = time.Now()
 	m.taskstatusList[index].taskphase = Taskrunning
 }
@@ -73,12 +75,20 @@ func (m *Master) RegisTask(index int, args *GetOneTaskArgs){
 
 //Worker申请一个mapreduce-Task
 func (m *Master) GetOneTask(args *GetOneTaskArgs, reply *GetOneTaskReply) error {
-	task := <- m.taskchan
-	reply.MRTask = &task
+	if m.Done() {
+		task := MRTask{
+			Exitflag: true,
+		}
+		reply.MRTask = &task
+		return nil
+	}else{
+		task:= <- m.taskchan
+		reply.MRTask = &task
 
-	index := reply.MRTask.index
-	m.RegisTask(index, args)
-	return nil
+		index := reply.MRTask.Index
+		m.RegisTask(index, args)
+		return nil
+	}
 }
 
 //worker申请自己的id号
@@ -87,11 +97,32 @@ func (m *Master) RegisWorker(args *RegisWorkerArgs, reply *RegisWorkerReply) err
 	defer m.mu.Unlock()
 
 	m.wokerseq += 1
-	reply.wokerid = m.wokerseq
+	reply.Wokerid = m.wokerseq
 
 	return nil
 }
 
+///worker汇报工作完成
+func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	index := args.Index
+
+	Dprint("report task: %+v, taskPhase: %+v", args, m.masterphase)
+	///检查是否正确的worker完成任务
+	if m.taskstatusList[index].workerid != args.Wokerid || m.masterphase != args.Masterphase {
+		return nil
+	}
+
+	if args.Finish {
+		m.taskstatusList[index].taskphase = Taskdone
+	}else {
+		m.taskstatusList[index].taskphase = Taskerror
+	}
+
+	go m.polling() //迅速检查是否完成作业
+	return nil
+}
 
 func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
@@ -137,16 +168,19 @@ func (m *Master) Done() bool {
 //
 
 func (m *Master) GetTask(index int) MRTask{
+
 	re := MRTask{
-		index : index,
-		Nreduce: m.nreduce,
-		Nmap: m.nmap,
-		Filename: m.files[index],
-		masterphase: m.masterphase,
+		Index:       index,
+		Nreduce:     m.nreduce,
+		Nmap:        m.nmap,
+		Masterphase: m.masterphase,
+		Exitflag:    false,
 	}
-
-	Dprint("GetTask:\nm:%+v, index:%d, lenfiles:%d, lents:%d", m, index, len(m.files), len(m.taskstatusList))
-
+	if m.masterphase == MapPhase {
+		re.Filename = m.files[index]
+	}
+	//Dprint("GetTask:\nm:%+v, index:%d, lenfiles:%d, lents:%d", m, index, len(m.files), len(m.taskstatusList))
+	Dprint("GetTask:\nindex:%d, lenfiles:%d, lents:%d", index, len(m.files), len(m.taskstatusList))
 	return re
 }
 
@@ -155,7 +189,7 @@ func (m *Master) polling() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.Done() {
+	if m.done {
 		return
 	}
 
@@ -171,6 +205,7 @@ func (m *Master) polling() {
 		case Taskrunning:
 			allworkdone = false
 			if time.Now().Sub(task.starttime) > MaxTasktime{
+				Dprint("Over Time!!!!!!!!!!!!\n")
 				m.taskstatusList[index].taskphase = Taskqueue
 				m.taskchan <- m.GetTask(index)
 				m.taskstatusList[index].workerid = -1
@@ -202,10 +237,9 @@ func (m *Master) tickSchedule() {
 	// 按说应该是每个 task 一个 timer，此处简单处理
 	for !m.Done() {
 		go m.polling()
-		time.Sleep(time.Millisecond * 500)
+		time.Sleep(ScheTime)
 	}
 }
-
 
 
 func MakeMaster(files []string, nReduce int) *Master {
@@ -214,16 +248,16 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.files = files
 	m.nreduce = nReduce
 	m.nmap = len(files)
-	m.taskstatusList = make([]TaskStatus, len(files))
+	m.taskstatusList = make([]TaskStatus, len(files)) //先按map任务数量分配大小
 	m.masterphase = MapPhase
 	m.done = false
-	m.taskchan = make(chan MRTask, math.Max(float64(m.nreduce), float64(m.nmap)))
-
-
+	m.taskchan = make(chan MRTask, int32(math.Max(float64(m.nreduce), float64(m.nmap))))
 
 	// Your code here.
-	m.server()
+
 	go m.tickSchedule()
+	m.server()
+	Dprint("master init")
 	return &m
 }
 

@@ -7,6 +7,7 @@ package mr
 //
 
 import (
+	"fmt"
 	"log"
 	"os"
 )
@@ -36,17 +37,10 @@ type ExampleReply struct {
 	Y int
 }
 
-type RegisterArgs struct {
-	X int
-}
-
-type RegisterReply struct {
-	Y int
-}
 
 
 type GetOneTaskArgs struct {
-	workerid int
+	Workerid int
 }
 
 type GetOneTaskReply struct {
@@ -58,16 +52,29 @@ type RegisWorkerArgs struct {
 }
 
 type RegisWorkerReply struct {
-	wokerid  int ///返回一个workerID
+	Wokerid  int ///返回一个workerID
 }
+
+type ReportTaskArgs struct {
+	Wokerid  int  ///worker的ID
+	Index    int  ///任务索引
+	Finish   bool ///是否完成任务
+	Masterphase MasterPhase
+}
+
+type ReportTaskReply struct {
+
+}
+
 
 //Mapreduce的Task结构
 type MRTask struct {
-	index        int ///这个任务在Master里面的索引
+	Index        int ///这个任务在Master里面的索引
 	Filename     string ///输入任务的input文件
-	masterphase  MasterPhase ///Master的状态，任务是map还是reduce
+	Masterphase  MasterPhase ///Master的状态，任务是map还是reduce
 	Nmap         int
 	Nreduce      int
+	Exitflag	 bool
 }
 
 
@@ -83,4 +90,21 @@ func masterSock() string {
 	s := "/var/tmp/824-mr-"
 	s += strconv.Itoa(os.Getuid())
 	return s
+}
+
+
+func reduceTmpName(mapIdx, reduceIdx int) string {
+	return fmt.Sprintf("mr-tmp-%d-%d", mapIdx, reduceIdx)
+}
+
+func reduceName(mapIdx, reduceIdx int) string {
+	return fmt.Sprintf("mr-%d-%d", mapIdx, reduceIdx)
+}
+
+func mergeName(reduceIdx int) string {
+	return fmt.Sprintf("mr-out-%d", reduceIdx)
+}
+
+func mergetmpName(reduceIdx int) string {
+	return fmt.Sprintf("mr-out-tmp-%d", reduceIdx)
 }

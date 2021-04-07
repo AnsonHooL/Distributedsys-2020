@@ -22,6 +22,7 @@ func maybeCrash() {
 	rr, _ := crand.Int(crand.Reader, max)
 	if rr.Int64() < 330 {
 		// crash!
+		print("Crash!!!!!!!!!!!!!!!!!!!!!!!\n")
 		os.Exit(1)
 	} else if rr.Int64() < 660 {
 		// delay for a while.
