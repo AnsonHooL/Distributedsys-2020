@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	"math/rand"
 	"os"
 	"sync"
@@ -33,8 +34,8 @@ import "../labrpc"
 //选举时间超时应该设置为 >> 心跳包时间间隔, 这里选了6倍心跳时间
 const(
 	HeartBeatTime      time.Duration = 150 * time.Millisecond
-	ElectionTimeOut    time.Duration = 150 * time.Millisecond * 5
-	MaxLockTime        time.Duration = 10  * time.Millisecond
+	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 5
+	MaxLockTime        time.Duration = 10 * time.Millisecond
 )
 
 //
@@ -64,7 +65,6 @@ const (
 
 type logEntry struct {
 	Term int
-
 }
 
 
@@ -116,12 +116,16 @@ func (rf *Raft) lock(m string) {
 
 func (rf *Raft) unlock(m string) {
 	rf.lockEnd = time.Now()
-	rf.lockName = ""
 	duration := rf.lockEnd.Sub(rf.lockStart)
 	if rf.lockName != "" && duration > MaxLockTime {
 		DPrintf("lock too long:%s:%s:iskill:%v", m, duration, rf.killed())
 	}
 	rf.mu.Unlock()
+}
+
+func Initrand() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	rand.Seed(time.Now().Unix() + 100)
 }
 
 
@@ -136,7 +140,6 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.unlock("Get State Unlock")
 
 	term = rf.currentTerm
-
 	if rf.peerstatus == Leader{
 		isleader = true
 	}else {
@@ -153,7 +156,7 @@ func randElectionTimeout() time.Time {
 }
 
 func randHeartBeatTimeout() time.Time {
-	r := time.Duration(rand.Int63()) % HeartBeatTime
+	r := time.Duration(rand.Int63()) * ( + 1) % HeartBeatTime
 	return time.Now().Add(HeartBeatTime + r)
 }
 
@@ -166,8 +169,6 @@ func (rf *Raft) switchStatus_nolock(status PeerStatus){
 	case Leader:
 		rf.peerstatus = Leader
 	}
-
-
 }
 
 //
@@ -231,7 +232,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term	       int   //对方节点的任期
-	voteGranted    bool  //
+	VoteGranted    bool  //
 }
 
 //
@@ -241,29 +242,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.lock("Request Vote")
 	defer rf.unlock("Request Vote")
-	defer DPrintf("vote:%t %d-->%d",reply.voteGranted, rf.me, args.CandidateID)
-
+	defer DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+	DPrintf("%d request vote to %d",args.CandidateID, rf.me)
 	if rf.currentTerm > args.Term{ //过期RPC
+		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
 	}else if rf.currentTerm == args.Term{
 		if rf.peerstatus == Leader || rf.peerstatus == Candidate{
+			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
 			return
-		}else {
+		}else { //follower
 			if rf.votedFor == args.CandidateID || rf.votedFor == -1{  //之前投的票RPC有可能丢失 或者 在这一轮没有投票
 				reply.Term = rf.currentTerm
-				reply.voteGranted = true
+				reply.VoteGranted = true
+				return
+			}else { //票投给了其他人
+				reply.Term = rf.currentTerm
+				reply.VoteGranted = false
 				return
 			}
 		}
 	}else { //RPC的任期比当前节点大,因此进行投票给他，不考虑发送日志情况下
 		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateID
 		rf.switchStatus_nolock(Follower)
+		rf.votedFor = args.CandidateID
 		rf.electTimeout = randElectionTimeout() ///重新定时
 		reply.Term = rf.currentTerm
-		reply.voteGranted = true
+		reply.VoteGranted = true
 		return
 	}
 
@@ -314,24 +321,34 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm int){
 	electionOneTime := ElectionTimeOut / 20  //发起一次RPC的时间不应该超过这个时间
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 5; i++ {
 		args := RequestVoteArgs{
 			Term: electerm,
 			CandidateID: rf.me,
 		}
 		reply := RequestVoteReply{
-			voteGranted: false,
+			VoteGranted: false,
 		}
+
+
+		//rf.lock("")
+		//if rf.peerstatus != Candidate{
+		//	rf.unlock("")
+		//	return
+		//}
+		//rf.unlock("")
 
 		ok := peer.Call("Raft.RequestVote", &args, &reply)
 
 		if ok == true{
-			if reply.voteGranted == false{
+			DPrintf("Request RPC fail success")
+			if reply.VoteGranted == false{
 				rf.lock("send request vote and handle")
 				if reply.Term > rf.currentTerm{
 					rf.currentTerm = reply.Term
 					rf.switchStatus_nolock(Follower)
 					rf.votedFor = -1
+					rf.electTimeout = randElectionTimeout()
 				}
 				rf.unlock("send request vote and handle")
 				return
@@ -342,9 +359,9 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm int){
 					return
 				}else {
 					rf.tickets = rf.tickets + 1
-					if rf.tickets > len(rf.peers)/2 {
+					if rf.tickets > len(rf.peers) / 2 {
 						rf.switchStatus_nolock(Leader)
-						rf.heartTimeout = randHeartBeatTimeout()
+						rf.heartTimeout = time.Now()
 						rf.unlock("send request vote and handle")
 						return
 					}
@@ -352,8 +369,8 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm int){
 					return
 				}
 			}
-
 		}else {
+			DPrintf("Request RPC fail")
 			time.Sleep(electionOneTime)
 		}
 	}
@@ -364,7 +381,7 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm int){
 
 func (rf *Raft) sendHeartBeattopeer(index int, peer *labrpc.ClientEnd){
 	rf.lock("sendHeartBeattopeer")
-	defer rf.unlock("sendHeartBeattopeer")
+
 	args := AppendEntriesArgs{
 		Term: rf.currentTerm,
 		LeaderId: rf.me,
@@ -372,17 +389,21 @@ func (rf *Raft) sendHeartBeattopeer(index int, peer *labrpc.ClientEnd){
 	reply := AppendEntriesReply{
 		Success: false,
 	}
+	rf.unlock("sendHeartBeattopeer")
+
 	ok := peer.Call("Raft.AppendEntries", &args, &reply)
 	if ok == true{
-		return
-	}else {
+		rf.lock("send Heart Beat topeer and handle")
+		defer rf.unlock("send Heart Beat topeer and handle")
 		if reply.Term > rf.currentTerm{
 			rf.switchStatus_nolock(Follower)
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.electTimeout = randElectionTimeout()
-
 		}
+
+		return
+	}else {
 	}
 }
 
@@ -402,7 +423,10 @@ func (rf *Raft) startElection(){
 		return
 	}else{
 		rf.switchStatus_nolock(Candidate)
+		DPrintf("server:%d old term:%d",rf.me,rf.currentTerm)
 		rf.currentTerm = rf.currentTerm + 1
+		DPrintf("server:%d new term:%d",rf.me,rf.currentTerm)
+		DPrintf("server:%d start an election, term: %d", rf.me, rf.currentTerm)
 		rf.votedFor = rf.me
 		rf.tickets = 1
 
@@ -412,9 +436,7 @@ func (rf *Raft) startElection(){
 			}else {
 				go rf.sendRequestVoteToPeer(peer, rf.currentTerm)
 			}
-
 		}
-		rf.electTimeout = randElectionTimeout() //成为了候选人也要重置竞选时间
 	}
 }
 
@@ -457,7 +479,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lock("AppendEntries")
 	defer rf.unlock("AppendEntryies")
-	defer DPrintf("LabA, Heart breat! Term:%t,Leader:%d-->Follower:%d",args.Term, args.LeaderId, rf.me)
+	defer DPrintf("LabA, Heart breat! Term:%v,Leader:%d-->Follower:%d",args.Term, args.LeaderId, rf.me)
 
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term{ //过期RPC
@@ -466,13 +488,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//if args.PrevLogIndex >= len(rf.logArray) || rf.logArray[args.PrevLogIndex].Term != args.PrevLogTerm{
 		//	return
 		//}else{
-			reply.Success = true
-			rf.electTimeout = randElectionTimeout()
-			return
+		//！！！！！！！！！！！这里出大问题
+		rf.switchStatus_nolock(Follower)
+		rf.votedFor = args.LeaderId
+		rf.currentTerm = args.Term
+		rf.electTimeout = randElectionTimeout()
+		reply.Success = true
+		return
 		//}
 	}else { //RPC的任期比当前节点大,因此升级
 		rf.switchStatus_nolock(Follower)
-		rf.votedFor = -1
+		rf.votedFor = args.LeaderId
 		rf.currentTerm = args.Term
 		rf.electTimeout = randElectionTimeout()
 		reply.Success = true
@@ -553,23 +579,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.switchStatus_nolock(Follower)
 	rf.votedFor = -1
 	rf.electTimeout = randElectionTimeout() //初始化设定选举时间
+	Initrand()
 
+	DPrintf("makexxxxxxxxxx")
 	///定时投票
 	go func(){
 
-		sleepforvote_Dura := ElectionTimeOut / 100 //每隔一段时间检查是否发起投票
+		sleepforvote_Dura := ElectionTimeOut / 20 //每隔一段时间检查是否发起投票
+
+		cout := 0
 
 		for{
+			rf.lock("read time")
 			if time.Now().After(rf.electTimeout) {
-
+				rf.electTimeout = randElectionTimeout() //成为了候选人也要重置竞选时间
+				DPrintf("server:%d,%dth :timeout",rf.me,cout)
+				cout = cout + 1
 				go rf.startElection()
-
+				rf.unlock("read time")
 			}else {
-
+				rf.unlock("read time")
 				time.Sleep(sleepforvote_Dura)
 
 			}
 		}
+
 	}()
 
 	///定时心跳
@@ -577,12 +611,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		sleepheartDura := HeartBeatTime / 10
 		for{
 			_, isLeader := rf.GetState()
-
+			rf.lock("read time")
 			if time.Now().After(rf.heartTimeout) && isLeader{ //Leader才发送
-
+				rf.heartTimeout = randHeartBeatTimeout()
 				go rf.sendHeartBreak()
-
+				rf.unlock("read time")
 			}else {
+				rf.unlock("read time")
 				time.Sleep(sleepheartDura)
 			}
 		}
