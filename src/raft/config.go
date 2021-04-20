@@ -8,7 +8,9 @@ package raft
 // test with the original before submitting.
 //
 
-import "../labrpc"
+import (
+	"../labrpc"
+)
 import "log"
 import "sync"
 import "testing"
@@ -467,6 +469,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			}
 			if retry == false {
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+				//os.Exit(-1) //thl modify
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
