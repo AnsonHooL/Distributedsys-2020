@@ -33,8 +33,8 @@ import "../labrpc"
 //Tester要求每秒心跳包少于10次
 //选举时间超时应该设置为 >> 心跳包时间间隔, 这里选了6倍心跳时间
 const(
-	HeartBeatTime      time.Duration = 120 * time.Millisecond
-	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 3
+	HeartBeatTime      time.Duration = 150 * time.Millisecond
+	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 5
 	MaxLockTime        time.Duration = 10 * time.Millisecond
 	ApplychTimeout     time.Duration = 100 * time.Millisecond
 )
@@ -95,7 +95,7 @@ type Raft struct {
 	commitIndex     int //已提交日志，Leader通过MatchIndex决定什么时候提交入职
 	lastApplied		int //已执行日志，作用几乎等同commitIndex
 	electTimeout    time.Time //超时，发起选举时间,然后我定时睡眠，检查是否超时了
-	heartTimeout    time.Time
+	heartTimeout    []time.Time
 	applyCh         chan ApplyMsg //回答日志已经提交，applyCh
 
 	//Leader才有的状态
@@ -104,7 +104,8 @@ type Raft struct {
 
 	///我添加的状态
 	tickets         int //选举得到的票数
-
+	EelectRPC       int //记录RPC数量
+	HeartRPC		int
 
 	//debug
 	lockStart	    time.Time
@@ -161,8 +162,9 @@ func randElectionTimeout() time.Time {
 
 //重置心跳时间
 func randHeartBeatTimeout() time.Time {
-	r := time.Duration(rand.Int63()) * ( + 1) % HeartBeatTime
-	return time.Now().Add(HeartBeatTime + r)
+	//r := time.Duration(rand.Int63())  % HeartBeatTime
+	//return time.Now().Add(HeartBeatTime + r)
+	return time.Now().Add(HeartBeatTime ) //【坑】用下面这条，心跳，然后就会出现问题，想了一下，是不是上面的rand减少了锁的争用啊，好像也不对
 }
 
 //返回me的最后一条日志的trem、index
@@ -359,7 +361,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogindex, lastlogterm int){
 	electionOneTime := ElectionTimeOut / 20  //发起一次RPC的时间不应该超过这个时间
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 1; i++ {
 		args := RequestVoteArgs{
 			Term: electerm,
 			CandidateID: rf.me,
@@ -378,6 +380,12 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogi
 		//rf.unlock("")
 
 		ok := peer.Call("Raft.RequestVote", &args, &reply)
+
+		rf.lock("")
+		rf.EelectRPC++
+		DPrintf("server:%d,Elect time:%d",rf.me,rf.EelectRPC)
+		rf.unlock("")
+
 
 		if ok == true{
 			//DPrintf("Request RPC fail success")
@@ -401,7 +409,13 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogi
 					if rf.tickets > len(rf.peers) / 2 {
 						rf.switchStatus_nolock(Leader)
 						DPrintf("Server:%d  become a Leader in Term: %d",rf.me, rf.currentTerm)
-						rf.heartTimeout = time.Now() //当选leader立刻发送心跳包
+
+
+						for i,_ := range rf.heartTimeout{
+							rf.heartTimeout[i] = time.Now()
+						}
+
+
 						rf.unlock("send request vote and handle")
 						return
 					}
@@ -436,6 +450,7 @@ func (rf* Raft) getAppendEntryArgs(peer int)(args AppendEntriesArgs){
 	args.PrevLogTerm  = rf.logArray[nextindex - 1].Term
 	args.PrevLogIndex = nextindex - 1
 	args.LdcommitIDX  = rf.commitIndex
+	//DPrintf("args of peer:%d,nextindex:%d,previndex:%d,prevterm:%d",peer,nextindex,nextindex-1,rf.logArray[nextindex-1])
 	return
 }
 
@@ -452,6 +467,11 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 	rf.unlock("sendHeartBeattopeer")
 
 	ok := peer.Call("Raft.AppendEntries", &args, &reply)
+	rf.lock("")
+	rf.HeartRPC++
+	DPrintf("server:%d,Append time:%d",rf.me,rf.HeartRPC)
+	rf.unlock("")
+
 
 	if ok == true{
 		rf.lock("send Heart Beat topeer and handle")
@@ -491,9 +511,11 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 			}else { //若日志匹配失败,现在还是慢速恢复
 				//DPrintf("prevlogterm:%d,prevlogindex:%d",args.PrevLogTerm, args.PrevLogIndex)
 				//DPrintf("%d : fail heart:%v",peerindex,reply.Success)
-				rf.nextIndex[peerindex]--
-				rf.heartTimeout = time.Now() //TestBackup2B,就靠这一行代码了，牛逼！【坑】
+				rf.nextIndex[peerindex] = args.PrevLogIndex //这里不能直接nextindex--，是不是我发多了啊RPC，是的,其实都行只要不多发RPC【好坑】
+				//rf.nextIndex[peerindex]--
+				rf.heartTimeout[peerindex] = time.Now() //TestBackup2B,就靠这一行代码了，牛逼！【坑】
 				if rf.nextIndex[peerindex] < 1 {
+					//DPrintf("args:%v",args)
 					DPrintf("Impossible Nextindex < 1.")
 					os.Exit(-1)
 				}
@@ -541,22 +563,17 @@ func (rf *Raft) startElection(){
 }
 
 
-func (rf *Raft) sendHeartBreak(){
+func (rf *Raft) sendHeartBreak(peerindex int){
 	rf.lock("send heart break")
 	defer rf.unlock("send heart break")
 
 	if rf.peerstatus != Leader{
 		return
 	}else {
-		for index, peer := range rf.peers{
-			if index == rf.me{
-				continue
-			}else {
-				go rf.sendHeartBeattopeer(index, peer)
-			}
+			go rf.sendHeartBeattopeer(peerindex, rf.peers[peerindex])
 		}
-	}
 }
+
 
 
 type AppendEntriesArgs struct {
@@ -601,7 +618,8 @@ func (rf* Raft) HandleAppendLog(args* AppendEntriesArgs)(flag bool){
 		}
 	}else {
 		DPrintf("follower get a log fail")
-		DPrintf("lastlogindex:%d,lastloginterm:%d, myloglen:%d",args.PrevLogIndex,args.PrevLogTerm,len(rf.logArray))
+		DPrintf("Leader's lastlogindex:%d,Leader's lastloginterm:%d, myloglen:%d",args.PrevLogIndex,args.PrevLogTerm,len(rf.logArray))
+		DPrintf("server:%d term:%d follower comIDX:%d, follower appid:%d",rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied)
 		flag = false
 	}
 	return
@@ -611,7 +629,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.lock("AppendEntries")
 	defer rf.unlock("AppendEntryies")
-	defer DPrintf("LabA, Heart breat! Term:%v,Leader:%d-->Follower:%d",args.Term, args.LeaderId, rf.me)
+	defer DPrintf("LabA, Heart breat! Term:%v,Leader:%d-->Follower:%d.Len of log:%d",args.Term, args.LeaderId, rf.me,len(args.Log))
 
 	reply.Term = rf.currentTerm
 
@@ -738,6 +756,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.logArray = make([]logEntry, 1)
+	rf.heartTimeout = make([]time.Time, len(peers))
+
 	rf.logArray[0] = logEntry{
 		Term: 0,
 		Index: 0,
@@ -770,21 +790,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 
 	///定时心跳
-	go func() {
-		sleepheartDura := HeartBeatTime / 10
-		for{
-			_, isLeader := rf.GetState()
-			rf.lock("read time")
-			if time.Now().After(rf.heartTimeout) && isLeader{ //Leader才发送
-				rf.heartTimeout = randHeartBeatTimeout()
-				go rf.sendHeartBreak()
-				rf.unlock("read time")
-			}else {
-				rf.unlock("read time")
-				time.Sleep(sleepheartDura)
+	for i, _ := range rf.peers {
+
+		go func(peerindex int) {
+			sleepheartDura := HeartBeatTime / 10
+			for{
+				_, isLeader := rf.GetState()
+
+				rf.lock("read time")
+
+				if time.Now().After(rf.heartTimeout[peerindex]) && isLeader && peerindex != rf.me{ //Leader才发送
+
+					rf.heartTimeout[peerindex] = randHeartBeatTimeout()
+
+					go rf.sendHeartBreak(peerindex)
+
+					rf.unlock("read time")
+				}else {
+					rf.unlock("read time")
+					time.Sleep(sleepheartDura)
+				}
 			}
-		}
-	}()
+		}(i)
+
+	}
+
 
 	go func() {
 		sleepforapply := ApplychTimeout / 10
