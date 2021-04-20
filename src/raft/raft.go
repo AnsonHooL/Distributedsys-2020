@@ -31,10 +31,10 @@ import "../labrpc"
 // import "../labgob"
 
 //Tester要求每秒心跳包少于10次
-//选举时间超时应该设置为 >> 心跳包时间间隔, 这里选了6倍心跳时间
+//选举时间超时应该设置为 >> 心跳包时间间隔, 这里选了2倍心跳时间
 const(
 	HeartBeatTime      time.Duration = 150 * time.Millisecond
-	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 5
+	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 3  //这个调小一点整体速度会上去
 	MaxLockTime        time.Duration = 10 * time.Millisecond
 	ApplychTimeout     time.Duration = 100 * time.Millisecond
 )
@@ -96,6 +96,7 @@ type Raft struct {
 	lastApplied		int //已执行日志，作用几乎等同commitIndex
 	electTimeout    time.Time //超时，发起选举时间,然后我定时睡眠，检查是否超时了
 	heartTimeout    []time.Time
+
 	applyCh         chan ApplyMsg //回答日志已经提交，applyCh
 
 	//Leader才有的状态
@@ -106,6 +107,8 @@ type Raft struct {
 	tickets         int //选举得到的票数
 	EelectRPC       int //记录RPC数量
 	HeartRPC		int
+	heartsendflag	[]bool //我加的没啥用。。TODO：看是否需要取消这个机制
+
 
 	//debug
 	lockStart	    time.Time
@@ -164,7 +167,7 @@ func randElectionTimeout() time.Time {
 func randHeartBeatTimeout() time.Time {
 	//r := time.Duration(rand.Int63())  % HeartBeatTime
 	//return time.Now().Add(HeartBeatTime + r)
-	return time.Now().Add(HeartBeatTime ) //【坑】用下面这条，心跳，然后就会出现问题，想了一下，是不是上面的rand减少了锁的争用啊，好像也不对
+	return time.Now().Add(HeartBeatTime ) //【坑】用下面这条，心跳，然后就会出现问题，想了一下，是不是上面的rand减少了锁的争用啊，好像也不对，确实没问题，是因为我一开始多发RPC的bug
 }
 
 //返回me的最后一条日志的trem、index
@@ -174,7 +177,7 @@ func (rf *Raft) lastLogTermIndex()(term,index int){
 	return
 }
 
-
+//切换结点身份
 func (rf *Raft) switchStatus_nolock(status PeerStatus){
 	switch status {
 	case Follower:
@@ -191,6 +194,13 @@ func (rf *Raft) switchStatus_nolock(status PeerStatus){
 		}
 		rf.matchIndex = make([]int, len(rf.peers))
 		rf.matchIndex[rf.me] = lastLogIndex
+
+		rf.heartsendflag = make([]bool, len(rf.peers))
+
+		for i,_ := range rf.heartsendflag{
+			rf.heartsendflag[i] = true
+		}
+
 	}
 }
 
@@ -454,6 +464,9 @@ func (rf* Raft) getAppendEntryArgs(peer int)(args AppendEntriesArgs){
 	return
 }
 
+
+
+
 func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 	rf.lock("sendHeartBeattopeer")
 	//这里不能用defer unlock，会被阻塞卡死
@@ -463,11 +476,14 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 	reply := AppendEntriesReply{
 		Success: false,
 	}
-
+	rf.heartsendflag[peerindex] = false
 	rf.unlock("sendHeartBeattopeer")
 
 	ok := peer.Call("Raft.AppendEntries", &args, &reply)
+
+
 	rf.lock("")
+	rf.heartsendflag[peerindex] = true
 	rf.HeartRPC++
 	DPrintf("server:%d,Append time:%d",rf.me,rf.HeartRPC)
 	rf.unlock("")
@@ -511,9 +527,12 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 			}else { //若日志匹配失败,现在还是慢速恢复
 				//DPrintf("prevlogterm:%d,prevlogindex:%d",args.PrevLogTerm, args.PrevLogIndex)
 				//DPrintf("%d : fail heart:%v",peerindex,reply.Success)
-				rf.nextIndex[peerindex] = args.PrevLogIndex //这里不能直接nextindex--，是不是我发多了啊RPC，是的,其实都行只要不多发RPC【好坑】
+				//rf.nextIndex[peerindex] = args.PrevLogIndex //这里不能直接nextindex--，是不是我发多了啊RPC，是的,其实都行只要不多发RPC【好坑】
+				rf.nextIndex[peerindex] = rf.FastNextIndex(&reply, &args)
+
+
 				//rf.nextIndex[peerindex]--
-				rf.heartTimeout[peerindex] = time.Now() //TestBackup2B,就靠这一行代码了，牛逼！【坑】
+				rf.heartTimeout[peerindex] = time.Now() //TestBackup2B,就靠这一行代码了，牛逼！【坑】，有了快速恢复，这条也是可加可不加
 				if rf.nextIndex[peerindex] < 1 {
 					//DPrintf("args:%v",args)
 					DPrintf("Impossible Nextindex < 1.")
@@ -567,7 +586,7 @@ func (rf *Raft) sendHeartBreak(peerindex int){
 	rf.lock("send heart break")
 	defer rf.unlock("send heart break")
 
-	if rf.peerstatus != Leader{
+	if rf.peerstatus != Leader && rf.heartsendflag[peerindex]{
 		return
 	}else {
 			go rf.sendHeartBeattopeer(peerindex, rf.peers[peerindex])
@@ -590,7 +609,47 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool //这是检验AppendEntry包的prevlog是否和自己匹配上了
+
+	//用于快速backup
+	Xterm   int  //记录不匹配时，该点的Term或者为-1
+	Xindex  int  //Term的第一条记录
+	Xlen    int  //空洞长度
 }
+
+
+func (rf* Raft) FastNextIndex(reply *AppendEntriesReply, args *AppendEntriesArgs)(nextindex int){
+	if reply.Xterm == -1 {
+		nextindex = args.PrevLogIndex - reply.Xlen
+	}else{
+		if rf.logArray[reply.Xindex].Term == reply.Xterm{
+			nextindex = reply.Xindex + 1
+		}else {
+			nextindex = reply.Xindex
+		}
+	}
+	return
+}
+
+func (rf* Raft) Fastbackup(args* AppendEntriesArgs)(Xterm,Xindex,Xlen int){
+	if args.PrevLogIndex >= len(rf.logArray){
+		Xterm  = -1
+		Xindex = -1
+		Xlen = args.PrevLogIndex - len(rf.logArray)
+	}else {
+		Xterm  = rf.logArray[args.PrevLogIndex].Term
+		Xindex = args.PrevLogIndex
+		Xlen   = -1
+		for {
+			if rf.logArray[Xindex - 1].Term != Xterm{
+				break
+			}else {
+				Xindex--
+			}
+		}
+	}
+	return
+}
+
 
 func (rf* Raft) HandleAppendLog(args* AppendEntriesArgs)(flag bool){
 
@@ -641,10 +700,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//	return
 		//}else{
 		//！！！！这里出大问题，可能是候选人收到了心跳包
-
 		rf.switchStatus_nolock(Follower)
 		rf.electTimeout = randElectionTimeout()
 		reply.Success = rf.HandleAppendLog(args)
+
+		if reply.Success == false{
+			reply.Xterm, reply.Xindex, reply.Xlen = rf.Fastbackup(args)
+		}
 		//reply.Success = true
 		//DPrintf("note:%d reply success:%v",rf.me,reply.Success)
 		//DPrintf("lastlogindex:%d,lastloginterm:%d, myloglen:%d",args.PrevLogIndex,args.PrevLogTerm,len(rf.logArray))
@@ -657,6 +719,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.electTimeout = randElectionTimeout()
 
 		reply.Success = rf.HandleAppendLog(args)
+		if reply.Success == false{
+			reply.Xterm, reply.Xindex, reply.Xlen = rf.Fastbackup(args)
+		}
 		//reply.Success = true
 		//DPrintf("note:%d reply success:%v",rf.me,reply.Success)
 		//DPrintf("lastlogindex:%d,lastloginterm:%d, myloglen:%d",args.PrevLogIndex,args.PrevLogTerm,len(rf.logArray))
@@ -697,6 +762,11 @@ func (rf *Raft) Start(command interface{}) (index, term int , isLeader bool) {
 		})
 		rf.matchIndex[rf.me] = rf.matchIndex[rf.me] + 1
 		DPrintf("note:%d,get a command.Term:%d,index:%d",rf.me,rf.currentTerm, index)
+
+		for i,_ := range rf.peers {    //【坑】有命令来了应该马上就发起心跳包，也是一个大大加快共识的点，加上了速度快很多
+			rf.heartTimeout[i] = time.Now()
+		}
+
 		return
 	}
 	// Your code here (2B).
@@ -837,9 +907,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					DPrintf("server:%d, send commnd, index: %d, term: %d. NOW is term:%d",rf.me,lastapplyid + 1,term,rf.currentTerm)
 					rf.unlock("read data")
 					rf.applyCh <- msg
-
-
-
 
 					rf.lock("read data")
 					rf.lastApplied = lastapplyid + 1
