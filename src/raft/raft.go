@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"../labgob"
+	"bytes"
 	"log"
 	"math/rand"
 	"os"
@@ -204,20 +206,28 @@ func (rf *Raft) switchStatus_nolock(status PeerStatus){
 	}
 }
 
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+
+func (rf *Raft) getPersistData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	//e.Encode(rf.commitIndex)
+	e.Encode(rf.logArray)
+	data := w.Bytes()
+	return data
+}
+
+//没加锁，一定要在锁范围内调用，并且要在数据更新后才能调用，数据一改就要更新，不能等，不能等到发送RPC才持久化，这样
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	data := rf.getPersistData()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -228,19 +238,25 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var term int
+	var voteFor int
+	var logs []logEntry
+	//var commitIndex int
+
+	if  d.Decode(&term) != nil ||
+		d.Decode(&voteFor) != nil ||
+		//d.Decode(&commitIndex) != nil ||
+		d.Decode(&logs) != nil {
+		log.Fatal("rf read persist err")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = voteFor
+		//rf.commitIndex = commitIndex
+		rf.logArray = logs
+	}
 }
 
 
@@ -277,7 +293,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.lock("Request Vote")
 	defer rf.unlock("Request Vote")
+
+
 	DPrintf("%d request vote to %d",args.CandidateID, rf.me)
+
 
 	if rf.currentTerm > args.Term{ //过期RPC
 		reply.VoteGranted = false
@@ -301,7 +320,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				if args.LastLogTerm > mylastlogterm || (args.LastLogTerm == mylastlogterm && args.LastLogIndex >= mylastlogindex) { //许安出最新的Leader
 					reply.Term = rf.currentTerm
 					reply.VoteGranted = true
+					rf.votedFor = args.CandidateID //这句我一开始居然忘记写了。。。差点出大问题，坑啊
 					DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+					rf.persist()
 					return
 				}
 			}
@@ -325,6 +346,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = -1
 			reply.VoteGranted = false
 		}
+
+		rf.persist()
 		return
 	}
 
@@ -406,6 +429,7 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogi
 					rf.switchStatus_nolock(Follower)
 					rf.votedFor = -1
 					rf.electTimeout = randElectionTimeout()
+					rf.persist()
 				}
 				rf.unlock("send request vote and handle")
 				return
@@ -419,12 +443,9 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogi
 					if rf.tickets > len(rf.peers) / 2 {
 						rf.switchStatus_nolock(Leader)
 						DPrintf("Server:%d  become a Leader in Term: %d",rf.me, rf.currentTerm)
-
-
 						for i,_ := range rf.heartTimeout{
 							rf.heartTimeout[i] = time.Now()
 						}
-
 
 						rf.unlock("send request vote and handle")
 						return
@@ -498,11 +519,14 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.electTimeout = randElectionTimeout()
+
+			rf.persist()
 		}else if args.Term == rf.currentTerm && rf.peerstatus == Leader{ //这里需要判断返回的reply，如果是同期的才有用，如果me已经不是leader就没用了【坑点！！！！！】
 			if reply.Success { //如日志匹配成功，更新结点的信息
 				//DPrintf("success heart")
 				rf.matchIndex[peerindex] = args.PrevLogIndex + len(args.Log) // match index = prev index + 发送长度
 				rf.nextIndex[peerindex] = rf.matchIndex[peerindex] + 1 //next index = match index + 1
+				oldcommitIDX := rf.commitIndex
 
 				if len(args.Log) > 0 { //非心跳包，才需要更新commit index
 					for comidx := rf.commitIndex + 1; comidx < len(rf.logArray) ; comidx++ {
@@ -522,6 +546,10 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 							break
 						}
 					}
+				}
+
+				if oldcommitIDX != rf.commitIndex{
+					rf.persist()
 				}
 
 			}else { //若日志匹配失败,现在还是慢速恢复
@@ -557,6 +585,7 @@ func (rf *Raft) startElection(){
 	rf.lock("Start an Election")
 	defer rf.unlock("Start an Election")
 
+
 	//除了Leader，其他都会发起竞选
 	if rf.peerstatus == Leader{
 		return
@@ -569,6 +598,7 @@ func (rf *Raft) startElection(){
 		rf.votedFor = rf.me
 		rf.tickets = 1
 
+		rf.persist()
 
 		for index, peer := range rf.peers{
 			if index == rf.me{
@@ -656,17 +686,25 @@ func (rf* Raft) HandleAppendLog(args* AppendEntriesArgs)(flag bool){
 	//判断日志是否成功匹配上
 	if  args.PrevLogIndex < len(rf.logArray) && rf.logArray[args.PrevLogIndex].Term == args.PrevLogTerm{
 		flag = true
+
 		if len(args.Log) > 0{
+
+			if args.PrevLogIndex + len(args.Log) < len(rf.logArray) && args.Log[len(args.Log)-1].Term == rf.logArray[args.PrevLogIndex + len(args.Log)].Term{
+				return //【坑】不能截断有效日志，因为RPC可能乱序到达
+			}
+
 			DPrintf("follower get a log success")
 			rf.logArray = append(rf.logArray[0 : args.PrevLogIndex + 1], args.Log...) //如果和Leader匹配的话，需要截断后面的
 
 			if args.LdcommitIDX >= len(rf.logArray) - 1{
+
 				rf.commitIndex = len(rf.logArray) - 1
+
 			}else{
 				rf.commitIndex = args.LdcommitIDX
 				///TODO：同样需要通知一下applych，更新一下applyid
 			}
-			DPrintf("server:%d term:%d follower comIDX:%d, follower appid:%d",rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied)
+			DPrintf("server:%d term:%d . follower comIDX:%d, follower appid:%d. log len:%d",rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied,len(rf.logArray))
 		}else {      //没收到新的log，心跳包，也要检查是否需要更新commitid【坑点】
 			if args.LdcommitIDX >= len(rf.logArray) - 1{
 				rf.commitIndex = len(rf.logArray) - 1
@@ -710,6 +748,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//reply.Success = true
 		//DPrintf("note:%d reply success:%v",rf.me,reply.Success)
 		//DPrintf("lastlogindex:%d,lastloginterm:%d, myloglen:%d",args.PrevLogIndex,args.PrevLogTerm,len(rf.logArray))
+		rf.persist()
 		return
 		//}
 	}else { //RPC的任期比当前节点大,因此升级
@@ -725,6 +764,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//reply.Success = true
 		//DPrintf("note:%d reply success:%v",rf.me,reply.Success)
 		//DPrintf("lastlogindex:%d,lastloginterm:%d, myloglen:%d",args.PrevLogIndex,args.PrevLogTerm,len(rf.logArray))
+		rf.persist()
 		return
 	}
 }
@@ -767,6 +807,7 @@ func (rf *Raft) Start(command interface{}) (index, term int , isLeader bool) {
 			rf.heartTimeout[i] = time.Now()
 		}
 
+		rf.persist()
 		return
 	}
 	// Your code here (2B).
@@ -815,23 +856,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
 	rf.switchStatus_nolock(Follower)
+
+	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.logArray = make([]logEntry, 1)
+	rf.commitIndex = 0
+
+
+	//2C
+	rf.readPersist(persister.ReadRaftState())
+
 	rf.electTimeout = randElectionTimeout() //初始化设定选举时间
 	Initrand()
-
 	//2B initial
 	rf.applyCh = applyCh
-	rf.commitIndex = 0
+
 	rf.lastApplied = 0
-	rf.logArray = make([]logEntry, 1)
+
 	rf.heartTimeout = make([]time.Time, len(peers))
 
 	rf.logArray[0] = logEntry{
 		Term: 0,
 		Index: 0,
 	}
+
 
 
 	DPrintf("make raft........")
@@ -899,7 +948,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					rf.lock("read data")
 					msg := ApplyMsg{
-						Command: rf.logArray[lastapplyid +1].Command,
+						Command: rf.logArray[lastapplyid +1].Command, //这里out of range 了
 						CommandValid: true,
 						CommandIndex: lastapplyid + 1,
 					}
@@ -921,6 +970,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+
 	return rf
 }
