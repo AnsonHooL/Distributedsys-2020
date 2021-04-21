@@ -36,7 +36,7 @@ import "../labrpc"
 //选举时间超时应该设置为 >> 心跳包时间间隔, 这里选了2倍心跳时间
 const(
 	HeartBeatTime      time.Duration = 150 * time.Millisecond
-	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 3  //这个调小一点整体速度会上去
+	ElectionTimeOut    time.Duration = 100 * time.Millisecond * 3 //这个调小一点整体速度会上去
 	MaxLockTime        time.Duration = 10 * time.Millisecond
 	ApplychTimeout     time.Duration = 100 * time.Millisecond
 )
@@ -109,8 +109,6 @@ type Raft struct {
 	tickets         int //选举得到的票数
 	EelectRPC       int //记录RPC数量
 	HeartRPC		int
-	heartsendflag	[]bool //我加的没啥用。。TODO：看是否需要取消这个机制
-
 
 	//debug
 	lockStart	    time.Time
@@ -197,11 +195,7 @@ func (rf *Raft) switchStatus_nolock(status PeerStatus){
 		rf.matchIndex = make([]int, len(rf.peers))
 		rf.matchIndex[rf.me] = lastLogIndex
 
-		rf.heartsendflag = make([]bool, len(rf.peers))
 
-		for i,_ := range rf.heartsendflag{
-			rf.heartsendflag[i] = true
-		}
 
 	}
 }
@@ -393,7 +387,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //}
 
 func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogindex, lastlogterm int){
-	electionOneTime := ElectionTimeOut / 20  //发起一次RPC的时间不应该超过这个时间
+	//electionOneTime := ElectionTimeOut / 20  //发起一次RPC的时间不应该超过这个时间
 	for i := 0; i < 1; i++ {
 		args := RequestVoteArgs{
 			Term: electerm,
@@ -456,7 +450,7 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogi
 			}
 		}else {
 			//DPrintf("Request RPC fail")
-			time.Sleep(electionOneTime)
+			//time.Sleep(electionOneTime) 只投一次票，就不睡了
 		}
 	}
 
@@ -497,14 +491,21 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 	reply := AppendEntriesReply{
 		Success: false,
 	}
-	rf.heartsendflag[peerindex] = false
+
+
 	rf.unlock("sendHeartBeattopeer")
+
+	//【坑坑坑】，必须检查自己是否还是Leader才能发起RPC，因为可能在发送前，自己的Term已经发送了变化，然后还发送就会出事
+	_, isLeader := rf.GetState()
+	if !isLeader{
+		return
+	}
 
 	ok := peer.Call("Raft.AppendEntries", &args, &reply)
 
 
 	rf.lock("")
-	rf.heartsendflag[peerindex] = true
+
 	rf.HeartRPC++
 	DPrintf("server:%d,Append time:%d",rf.me,rf.HeartRPC)
 	rf.unlock("")
@@ -524,8 +525,11 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 		}else if args.Term == rf.currentTerm && rf.peerstatus == Leader{ //这里需要判断返回的reply，如果是同期的才有用，如果me已经不是leader就没用了【坑点！！！！！】
 			if reply.Success { //如日志匹配成功，更新结点的信息
 				//DPrintf("success heart")
-				rf.matchIndex[peerindex] = args.PrevLogIndex + len(args.Log) // match index = prev index + 发送长度
-				rf.nextIndex[peerindex] = rf.matchIndex[peerindex] + 1 //next index = match index + 1
+				if rf.matchIndex[peerindex] < args.PrevLogIndex + len(args.Log){
+					rf.matchIndex[peerindex] = args.PrevLogIndex + len(args.Log) // match index = prev index + 发送长度
+					rf.nextIndex[peerindex] = rf.matchIndex[peerindex] + 1 //next index = match index + 1
+				}
+
 				oldcommitIDX := rf.commitIndex
 
 				if len(args.Log) > 0 { //非心跳包，才需要更新commit index
@@ -557,7 +561,6 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 				//DPrintf("%d : fail heart:%v",peerindex,reply.Success)
 				//rf.nextIndex[peerindex] = args.PrevLogIndex //这里不能直接nextindex--，是不是我发多了啊RPC，是的,其实都行只要不多发RPC【好坑】
 				rf.nextIndex[peerindex] = rf.FastNextIndex(&reply, &args)
-
 
 				//rf.nextIndex[peerindex]--
 				rf.heartTimeout[peerindex] = time.Now() //TestBackup2B,就靠这一行代码了，牛逼！【坑】，有了快速恢复，这条也是可加可不加
@@ -616,7 +619,7 @@ func (rf *Raft) sendHeartBreak(peerindex int){
 	rf.lock("send heart break")
 	defer rf.unlock("send heart break")
 
-	if rf.peerstatus != Leader && rf.heartsendflag[peerindex]{
+	if rf.peerstatus != Leader {
 		return
 	}else {
 			go rf.sendHeartBeattopeer(peerindex, rf.peers[peerindex])
@@ -943,23 +946,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			commitid    := rf.commitIndex
 			rf.unlock("read apply")
 
+
 			if lastapplyid < commitid {
 				for ;lastapplyid < commitid; lastapplyid++{
 
 					rf.lock("read data")
+					//TODO：下面的数据只在这里被修改所以不用加锁，只是暂时不加锁
 					msg := ApplyMsg{
 						Command: rf.logArray[lastapplyid +1].Command, //这里out of range 了
 						CommandValid: true,
 						CommandIndex: lastapplyid + 1,
 					}
+
 					term := rf.logArray[lastapplyid+1].Term
 					DPrintf("server:%d, send commnd, index: %d, term: %d. NOW is term:%d",rf.me,lastapplyid + 1,term,rf.currentTerm)
+
 					rf.unlock("read data")
+
 					rf.applyCh <- msg
 
-					rf.lock("read data")
+					//rf.lock("read data")
 					rf.lastApplied = lastapplyid + 1
-					rf.unlock("read data")
+					//rf.unlock("read data")
 
 
 				}
