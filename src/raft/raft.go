@@ -307,6 +307,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if rf.votedFor == args.CandidateID {  //之前投的票RPC有可能丢失 或者 在这一轮没有投票
 				reply.Term = rf.currentTerm
 				reply.VoteGranted = true
+				rf.electTimeout = randElectionTimeout() ///重新定时,注意这里一定要正确的重置，否则选举很容易活锁【坑坑坑】
 				DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
 				return
 			} else if rf.votedFor == -1 { //还没投票呢
@@ -314,6 +315,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				if args.LastLogTerm > mylastlogterm || (args.LastLogTerm == mylastlogterm && args.LastLogIndex >= mylastlogindex) { //许安出最新的Leader
 					reply.Term = rf.currentTerm
 					reply.VoteGranted = true
+					rf.electTimeout = randElectionTimeout() ///重新定时
 					rf.votedFor = args.CandidateID //这句我一开始居然忘记写了。。。差点出大问题，坑啊
 					DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
 					rf.persist()
@@ -329,12 +331,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}else { //RPC的任期比当前节点大,因此进行投票给他，不考虑发送日志情况下,现在要考虑了！！！！【坑，忘记改了lab2b】
 		rf.currentTerm = args.Term
 		rf.switchStatus_nolock(Follower)
-		rf.electTimeout = randElectionTimeout() ///重新定时
+
 		reply.Term = rf.currentTerm
 
 		mylastlogterm,mylastlogindex := rf.lastLogTermIndex()
 		if args.LastLogTerm > mylastlogterm || (args.LastLogTerm == mylastlogterm && args.LastLogIndex >= mylastlogindex) {
 			rf.votedFor = args.CandidateID
+			rf.electTimeout = randElectionTimeout() ///重新定时
 			reply.VoteGranted = true
 		}else {
 			rf.votedFor = -1
