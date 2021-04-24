@@ -908,7 +908,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}else {
 				rf.unlock("read time")
 				time.Sleep(sleepforvote_Dura)
-
+				if rf.killed(){
+					return
+				}
 			}
 		}
 
@@ -934,6 +936,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}else {
 					rf.unlock("read time")
 					time.Sleep(sleepheartDura)
+					if rf.killed(){
+						return
+					}
 				}
 			}
 		}(i)
@@ -944,6 +949,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		sleepforapply := ApplychTimeout / 10
 		for {
+
 			rf.lock("read apply")
 			lastapplyid := rf.lastApplied
 			commitid    := rf.commitIndex
@@ -966,16 +972,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					rf.unlock("read data")
 
+					KVPrintf("send a msg to KVserver")
 					rf.applyCh <- msg
 
-					//rf.lock("read data")
+					rf.lock("read data")
 					rf.lastApplied = lastapplyid + 1
-					//rf.unlock("read data")
+					rf.unlock("read data")
 
 
 				}
 			}else {
 				time.Sleep(sleepforapply)
+				if rf.killed(){
+					return
+				}
 			}
 		}
 	}()

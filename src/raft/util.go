@@ -11,3 +11,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+const KVDebug = 0
+
+func KVPrintf(format string, a ...interface{}) (n int, err error) {
+	if KVDebug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
