@@ -17,7 +17,7 @@ Lab2C(√)
 
 脚本位置在src/ratf/go-test-many.sh中，是6.824助教提供的。
 
-![lab2测试](src\doc\lab2测试.jpg)
+![lab2测试](src\doc\lab2-test.jpg)
 
 2021/04/24：
 
