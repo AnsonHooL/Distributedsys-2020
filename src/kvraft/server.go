@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -14,7 +15,7 @@ import (
 
 const(
 	MaxLockTime        time.Duration = 10  * time.Millisecond
-	MaxWaitopTime	   time.Duration = 500 * time.Millisecond
+	MaxWaitopTime	   time.Duration = 100 * time.Millisecond
 	ChangeLeaderTime   time.Duration = 20  * time.Millisecond
 )
 
@@ -77,7 +78,7 @@ type KVServer struct {
 	kvStore        map[string]string
 	applyHistory   map[int64]int64 //保存client对应最新的seq-id，用来过滤重复请求.key是clientid，value是seqid
 	resultCache	   map[int64]ClerkResult //保存client的结果，key是clientid，value是result
-
+	persister      *raft.Persister
 
 	//Debug
 	lockStart	    time.Time
@@ -96,9 +97,9 @@ func (kv *KVServer) waitopreply(op Op)(re ClerkResult){
 		return
 	}
 
-	waittime := MaxWaitopTime / 10
+	waittime := MaxWaitopTime / 100
 
-	for i := 0; i < 10; i++{
+	for i := 0; i < 100; i++{
 		time.Sleep(waittime)
 		kv.lock("waitop")
 		if op.SeqcmdID == kv.applyHistory[op.ClientId]{
@@ -239,6 +240,29 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) readPersist(data []byte){
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvData       map[string]string
+	var applyhistory map[int64]int64
+	var resultcache  map[int64]ClerkResult
+	if d.Decode(&kvData) != nil ||
+		d.Decode(&applyhistory) != nil ||
+			d.Decode(&resultcache)!= nil {
+		log.Fatal("kv read persist err")
+	} else {
+		kv.kvStore      = kvData
+		kv.applyHistory = applyhistory
+		kv.resultCache  = resultcache
+	}
+}
+
+
 func (kv *KVServer) dataGet(key string) (err Err, val string) {
 	if v, ok := kv.kvStore[key]; ok {
 		err = OK
@@ -251,6 +275,38 @@ func (kv *KVServer) dataGet(key string) (err Err, val string) {
 	}
 }
 
+
+func (kv *KVServer) genSnapshotData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(kv.kvStore); err != nil {
+		panic(err)
+	}
+	if err := e.Encode(kv.applyHistory); err != nil {
+		panic(err)
+	}
+	if err := e.Encode(kv.resultCache); err != nil {
+		panic(err)
+	}
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) savesnapshot(logIndex int){
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+
+	//需要做快照
+	DPrintf("raft: %d,Save snapshot!!!!!!!!!!!!!!!!!!!!!!", kv.me)
+	data := kv.genSnapshotData()
+	//time.Sleep(100 * time.Millisecond)
+	kv.rf.SavePersistAndShnapshot(logIndex, data)
+}
+
 func (kv *KVServer) waitapply(){
 
 	for{
@@ -261,10 +317,16 @@ func (kv *KVServer) waitapply(){
 		case msg := <- kv.applyCh:
 			if !msg.CommandValid{
 				DPrintf("Cmmmand valid:%v",msg.CommandValid)
+
+				kv.lock("read persist")
+				kv.readPersist(kv.persister.ReadSnapshot())
+				kv.unlock("read persisit")
+
 			}else {
 				op := msg.Command.(Op)
 				clientid := op.ClientId
 				opid     := op.SeqcmdID
+
 				DPrintf("get apply clinet id:%d seq id%d", clientid, opid)
 				kv.lock("read state machine")
 				if kv.applyHistory[clientid] == opid{
@@ -298,6 +360,10 @@ func (kv *KVServer) waitapply(){
 					continue
 				}
 
+				msgindex := msg.CommandIndex
+				kv.lock("save snap")
+				kv.savesnapshot(msgindex)
+				kv.unlock("save snap")
 			}
 		}
 
@@ -328,15 +394,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.persister = persister
 	// You may need initialization code here.
 	kv.kvStore      = make(map[string]string)
 	kv.applyHistory = make(map[int64]int64)
 	kv.resultCache  = make(map[int64]ClerkResult)
-	kv.stopCh = make(chan struct{})
+	kv.stopCh       = make(chan struct{})
+	kv.readPersist(kv.persister.ReadSnapshot())
 
 	go kv.waitapply()
 

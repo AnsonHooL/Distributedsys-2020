@@ -89,9 +89,11 @@ type Raft struct {
 	peerstatus      PeerStatus //节点身份
 
 	///持久化的状态
-	currentTerm     int //节点当前任期
-	votedFor		int //节点所投票,一般转成follower时需要重置
-	logArray        []logEntry //日志
+	currentTerm       int //节点当前任期
+	votedFor		  int //节点所投票,一般转成follower时需要重置
+	logArray          []logEntry //日志,日志会压缩
+	lastSnapshotIndex int //快照的最后一条index
+	lastSnapshotTerm  int //快照的最后一条term
 
 	//所有节点都有的状态
 	commitIndex     int //已提交日志，Leader通过MatchIndex决定什么时候提交入职
@@ -173,7 +175,8 @@ func randHeartBeatTimeout() time.Time {
 //返回me的最后一条日志的trem、index
 func (rf *Raft) lastLogTermIndex()(term,index int){
 	term  = rf.logArray[len(rf.logArray) - 1].Term
-	index = len(rf.logArray) - 1
+	index = len(rf.logArray) - 1 + rf.lastSnapshotIndex
+	//TODO:修改index 和 term
 	return
 }
 
@@ -186,16 +189,16 @@ func (rf *Raft) switchStatus_nolock(status PeerStatus){
 		rf.peerstatus = Candidate
 	case Leader:
 		rf.peerstatus = Leader
+
 		_, lastLogIndex := rf.lastLogTermIndex()
 
 		rf.nextIndex = make([]int, len(rf.peers))
+
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIndex[i] = lastLogIndex + 1
 		}
 		rf.matchIndex = make([]int, len(rf.peers))
 		rf.matchIndex[rf.me] = lastLogIndex
-
-
 
 	}
 }
@@ -212,7 +215,9 @@ func (rf *Raft) getPersistData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	//e.Encode(rf.commitIndex)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
 	e.Encode(rf.logArray)
 	data := w.Bytes()
 	return data
@@ -238,20 +243,78 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var voteFor int
 	var logs []logEntry
-	//var commitIndex int
+	var lastspindex int
+	var lastspterm  int
+	var commitIndex int
 
 	if  d.Decode(&term) != nil ||
 		d.Decode(&voteFor) != nil ||
-		//d.Decode(&commitIndex) != nil ||
+		d.Decode(&commitIndex) != nil ||
+		d.Decode(&lastspindex) != nil ||
+		d.Decode(&lastspterm) != nil ||
 		d.Decode(&logs) != nil {
 		log.Fatal("rf read persist err")
 	} else {
 		rf.currentTerm = term
-		rf.votedFor = voteFor
-		//rf.commitIndex = commitIndex
+		rf.votedFor    = voteFor
+		rf.commitIndex = commitIndex
+		rf.lastSnapshotTerm  = lastspterm
+		rf.lastSnapshotIndex = lastspindex
 		rf.logArray = logs
+		//TODO:修改index 和 term
+		rf.lastApplied = rf.lastSnapshotIndex //没毛病吧，状态机至少apply到这条记录了
+		//rf.commitIndex = rf.lastSnapshotIndex
 	}
 }
+
+func (rf *Raft) getLogByIndex(logIndex int) (logEntry) {
+	idx := logIndex - rf.lastSnapshotIndex
+	return rf.logArray[idx]
+}
+
+func (rf *Raft) getRealIdxByLogIndex(logIndex int) int {
+	idx := logIndex - rf.lastSnapshotIndex
+	if idx < 0 {
+		return -1
+	} else {
+		return idx
+	}
+}
+
+
+func (rf *Raft) SavePersistAndShnapshot(logIndex int, snapshotData []byte) {
+	rf.lock("savePS")
+	defer rf.unlock("savePS")
+
+	KVPrintf("savePS get logindex:%d", logIndex)
+
+	if logIndex <= rf.lastSnapshotIndex { //比raft的快照还旧，无需进行快照
+		return
+	}
+
+	//TODO，有问题，我没有持久化 commit index，这个比较应该不成立，不应该是成立的，commit index 必须大于等于 apply index
+	if logIndex > rf.commitIndex {
+		DPrintf("rf.me:%d, log index:%d, commit index:%d",rf.me,logIndex,rf.commitIndex)
+		panic("logindex > rf.commitdex")
+	}
+
+
+	KVPrintf("Note:%d,before savePS, logindex:%d, lastspindex:%d, logslen:%d, logs:%+v", rf.me,logIndex, rf.lastSnapshotIndex, len(rf.logArray), rf.logArray)
+
+	//// logindex 一定在 raft.logEntries 中存在
+	lastLog := rf.getLogByIndex(logIndex)
+
+	rf.logArray = rf.logArray[rf.getRealIdxByLogIndex(logIndex):] //现在logarray[0]，就是快照的lastlog，就是无用之快照
+
+	rf.lastSnapshotIndex = logIndex
+	rf.lastSnapshotTerm = lastLog.Term
+
+	persistData := rf.getPersistData()
+
+	rf.persister.SaveStateAndSnapshot(persistData, snapshotData)
+}
+
+
 
 
 
@@ -312,7 +375,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				return
 			} else if rf.votedFor == -1 { //还没投票呢
 				mylastlogterm,mylastlogindex := rf.lastLogTermIndex()
-				if args.LastLogTerm > mylastlogterm || (args.LastLogTerm == mylastlogterm && args.LastLogIndex >= mylastlogindex) { //许安出最新的Leader
+				if args.LastLogTerm > mylastlogterm || (args.LastLogTerm == mylastlogterm && args.LastLogIndex >= mylastlogindex) { //选出最新的Leader
 					reply.Term = rf.currentTerm
 					reply.VoteGranted = true
 					rf.electTimeout = randElectionTimeout() ///重新定时
@@ -389,6 +452,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //	return ok
 //}
 
+//日志压缩完全不影响，投票机制，因为只需要计算出正确的last term 、 last index即可
 func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogindex, lastlogterm int){
 	//electionOneTime := ElectionTimeOut / 20  //发起一次RPC的时间不应该超过这个时间
 	for i := 0; i < 1; i++ {
@@ -461,21 +525,35 @@ func (rf *Raft) sendRequestVoteToPeer(peer *labrpc.ClientEnd, electerm, lastlogi
 }
 
 //生成每个心跳包的args，计算出应该发生多少log给peer
-func (rf* Raft) getAppendEntryArgs(peer int)(args AppendEntriesArgs){
+func (rf* Raft) getAppendEntryArgs(peer int)(args AppendEntriesArgs, installflag bool){
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
+	installflag = false
 
 	_, lastindex := rf.lastLogTermIndex()
 	nextindex := rf.nextIndex[peer]
 
 	//如果最后一个log index 大于等于改发给peer的nextindex，那么就应该发送日志
-	if lastindex >= nextindex{
-		args.Log = rf.logArray[nextindex: ]
+	//TODO:修改index 和 term，验证nextindex是否大于 lastsnapshotindex，install snapshot
+
+	if lastindex >= nextindex && rf.getRealIdxByLogIndex(nextindex) > 0 { //还有日志在Leader这里
+
+		args.Log = rf.logArray[rf.getRealIdxByLogIndex(nextindex): ]
+
+	}else if lastindex >= nextindex &&  rf.getRealIdxByLogIndex(nextindex) <= 0 { //Leader已经没有要发给follower的日志
+
+		//TODO: call insatal snapshot RPC
+		go rf.sendSnapshot(peer)
+		rf.heartTimeout[peer] = rf.heartTimeout[peer].Add(2 * time.Second)
+		installflag = true
+		return
+
 	}else {
 		args.Log = nil
 	}
 
-	args.PrevLogTerm  = rf.logArray[nextindex - 1].Term
+	//TODO:修改index 和 term，这里得修改一下，不能直接写index
+	args.PrevLogTerm  = rf.getLogByIndex(nextindex - 1).Term
 	args.PrevLogIndex = nextindex - 1
 	args.LdcommitIDX  = rf.commitIndex
 	//DPrintf("args of peer:%d,nextindex:%d,previndex:%d,prevterm:%d",peer,nextindex,nextindex-1,rf.logArray[nextindex-1])
@@ -489,7 +567,12 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 	rf.lock("sendHeartBeattopeer")
 	//这里不能用defer unlock，会被阻塞卡死
 
-	args := rf.getAppendEntryArgs(peerindex)
+	args, installflag := rf.getAppendEntryArgs(peerindex)
+
+	if installflag == true{
+		rf.unlock("sendHeartBeattopeer")
+		return
+	}
 
 	reply := AppendEntriesReply{
 		Success: false,
@@ -534,9 +617,11 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 				}
 
 				oldcommitIDX := rf.commitIndex
+				_,lastindex  := rf.lastLogTermIndex()
 
 				if len(args.Log) > 0 { //非心跳包，才需要更新commit index
-					for comidx := rf.commitIndex + 1; comidx < len(rf.logArray) ; comidx++ {
+					//TODO:修改index 和 term,这里得改最后一条的idx
+					for comidx := rf.commitIndex + 1; comidx <= lastindex ; comidx++ {
 						vote := 0
 						for j,_  := range rf.peers{
 							if rf.matchIndex[j] >= comidx{
@@ -544,7 +629,11 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 							}
 						}
 						if vote > len(rf.peers) / 2{ //过半才commit
-							if rf.logArray[comidx].Term == rf.currentTerm{ //注意：只能确认自己任期产生的log
+							if rf.getRealIdxByLogIndex(comidx) == -1{ //可能快照被改变了
+								break
+							}
+
+							if rf.logArray[rf.getRealIdxByLogIndex(comidx)].Term == rf.currentTerm{ //注意：只能确认自己任期产生的log
 								rf.commitIndex = comidx
 								DPrintf("Leader:%d commit log index:%d in term:%d",rf.me,comidx,rf.currentTerm)
 							}
@@ -631,6 +720,7 @@ func (rf *Raft) sendHeartBreak(peerindex int){
 
 
 
+
 type AppendEntriesArgs struct {
 	Term         int //Leader的任期
 	LeaderId     int //follower redirect Leader
@@ -654,29 +744,61 @@ type AppendEntriesReply struct {
 
 
 func (rf* Raft) FastNextIndex(reply *AppendEntriesReply, args *AppendEntriesArgs)(nextindex int){
+	//TODO:修改index 和 term，稍微改一下index就行，原理应该没什么问题，Xindex不能直接取
 	if reply.Xterm == -1 {
-		nextindex = args.PrevLogIndex - reply.Xlen
+
+		nextindex = args.PrevLogIndex - reply.Xlen //这里无所谓，计算出正确的nextindex即可
+
 	}else{
-		if rf.logArray[reply.Xindex].Term == reply.Xterm{
+
+		if rf.getRealIdxByLogIndex(reply.Xindex) < 0 {
+			nextindex = rf.lastSnapshotIndex
+			return
+		}
+
+		//TODO：下面老是out of range ，仔细检查rang[177] of 44
+		if rf.logArray[rf.getRealIdxByLogIndex(reply.Xindex)].Term == reply.Xterm{
+
 			nextindex = reply.Xindex + 1
+
 		}else {
+
 			nextindex = reply.Xindex
+
 		}
 	}
 	return
 }
 
 func (rf* Raft) Fastbackup(args* AppendEntriesArgs)(Xterm,Xindex,Xlen int){
-	if args.PrevLogIndex >= len(rf.logArray){
+	//TODO:修改index 和 term，这里得改
+
+	//if args.PrevLogIndex <= rf.lastSnapshotIndex {
+	//	//不可能进入
+	//	Xindex = rf.lastSnapshotIndex
+	//	Xterm  = rf.lastSnapshotTerm
+	//	Xlen   = -1
+	//	DPrintf("flower:%d,args.PrevLogIndex:%d,rf.lastSnapshotIndex:%d",rf.me,args.PrevLogIndex,rf.lastSnapshotIndex)
+	//	log.Fatal("follower:%d,Impossinle preindex.")
+	//	return
+	//}
+
+	if args.PrevLogIndex >= (len(rf.logArray) + rf.lastSnapshotIndex){
 		Xterm  = -1
 		Xindex = -1
-		Xlen = args.PrevLogIndex - len(rf.logArray)
+		Xlen = args.PrevLogIndex - (len(rf.logArray) + rf.lastSnapshotIndex)
 	}else {
-		Xterm  = rf.logArray[args.PrevLogIndex].Term
-		Xindex = args.PrevLogIndex
+
+		Xterm  = rf.logArray[rf.getRealIdxByLogIndex(args.PrevLogIndex)].Term
+		Xindex = args.PrevLogIndex //这里不可能比last snap shot index小吧
 		Xlen   = -1
+
+		if Xindex < rf.lastSnapshotIndex{
+			log.Fatal("Impossinle xindex.")
+		}
+
 		for {
-			if rf.logArray[Xindex - 1].Term != Xterm{
+			if rf.getRealIdxByLogIndex(Xindex) <= 1 || rf.logArray[rf.getRealIdxByLogIndex(Xindex - 1)].Term != Xterm{
 				break
 			}else {
 				Xindex--
@@ -690,32 +812,76 @@ func (rf* Raft) Fastbackup(args* AppendEntriesArgs)(Xterm,Xindex,Xlen int){
 func (rf* Raft) HandleAppendLog(args* AppendEntriesArgs)(flag bool){
 
 	//判断日志是否成功匹配上
-	if  args.PrevLogIndex < len(rf.logArray) && rf.logArray[args.PrevLogIndex].Term == args.PrevLogTerm{
-		flag = true
+	//TODO:修改index 和 term,这里index都得改，大刀阔斧
 
+	//if args.PrevLogIndex < rf.lastSnapshotIndex {  //
+	//	flag = false
+	//	return
+	//	log.Fatal("Impossinle args preindex.")
+	//}
+
+	if  args.PrevLogIndex <= rf.lastSnapshotIndex || //是有可能的，如果RPC发生乱序了如果。这是乱序发送的后果咯
+		(rf.getRealIdxByLogIndex(args.PrevLogIndex) < len(rf.logArray) && rf.logArray[rf.getRealIdxByLogIndex(args.PrevLogIndex)].Term == args.PrevLogTerm){
+
+		flag = true
 		if len(args.Log) > 0{
 
-			if args.PrevLogIndex + len(args.Log) < len(rf.logArray) && args.Log[len(args.Log)-1].Term == rf.logArray[args.PrevLogIndex + len(args.Log)].Term{
+			if args.PrevLogIndex + len(args.Log) <= rf.lastSnapshotIndex{
+				return
+			}
+
+			if rf.getRealIdxByLogIndex(args.PrevLogIndex + len(args.Log)) < len(rf.logArray) &&
+				args.Log[len(args.Log)-1].Term == rf.logArray[rf.getRealIdxByLogIndex(args.PrevLogIndex + len(args.Log))].Term{
 				return //【坑】不能截断有效日志，因为RPC可能乱序到达
 			}
 
 			DPrintf("follower get a log success")
-			rf.logArray = append(rf.logArray[0 : args.PrevLogIndex + 1], args.Log...) //如果和Leader匹配的话，需要截断后面的
 
-			if args.LdcommitIDX >= len(rf.logArray) - 1{
 
-				rf.commitIndex = len(rf.logArray) - 1
+			if rf.getRealIdxByLogIndex(args.PrevLogIndex + 1) <= 0 {
+				//【坑啊部分日志可能已经被截断了】
+				index := rf.lastSnapshotIndex - args.PrevLogIndex - 1
+
+				rf.logArray = append(args.Log[index : ])
+
+			}else {
+				rf.logArray = append(rf.logArray[0 : rf.getRealIdxByLogIndex(args.PrevLogIndex + 1)], args.Log...) //如果和Leader匹配的话，需要截断后面的
+			}
+
+			if args.LdcommitIDX >= len(rf.logArray) - 1 + rf.lastSnapshotIndex{
+
+				if len(rf.logArray) - 1 + rf.lastSnapshotIndex > rf.commitIndex {
+
+					rf.commitIndex = len(rf.logArray) - 1 + rf.lastSnapshotIndex
+
+				}
 
 			}else{
-				rf.commitIndex = args.LdcommitIDX
+				if args.LdcommitIDX > rf.commitIndex{
+
+					rf.commitIndex = args.LdcommitIDX
+
+				}
+
 				///TODO：同样需要通知一下applych，更新一下applyid
 			}
+
 			DPrintf("server:%d term:%d . follower comIDX:%d, follower appid:%d. log len:%d",rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied,len(rf.logArray))
 		}else {      //没收到新的log，心跳包，也要检查是否需要更新commitid【坑点】
-			if args.LdcommitIDX >= len(rf.logArray) - 1{
-				rf.commitIndex = len(rf.logArray) - 1
+			if args.LdcommitIDX >= len(rf.logArray) - 1 + rf.lastSnapshotIndex{
+				if len(rf.logArray) - 1 + rf.lastSnapshotIndex > rf.commitIndex {
+
+					rf.commitIndex = len(rf.logArray) - 1 + rf.lastSnapshotIndex
+
+				}
 			}else{
-				rf.commitIndex = args.LdcommitIDX
+
+				if args.LdcommitIDX > rf.commitIndex{
+
+					rf.commitIndex = args.LdcommitIDX
+
+				}
+
 				///TODO：同样需要通知一下applych，更新一下applyid
 			}
 		}
@@ -746,6 +912,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//！！！！这里出大问题，可能是候选人收到了心跳包
 		rf.switchStatus_nolock(Follower)
 		rf.electTimeout = randElectionTimeout()
+
 		reply.Success = rf.HandleAppendLog(args)
 
 		if reply.Success == false{
@@ -775,6 +942,107 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
+func (rf *Raft) sendSnapshot(peeridx int){
+	rf.lock("send sanpshot....")
+	args := InstallSnapshotArgs{
+		Term: rf.currentTerm,
+		LastIncludedTerm:  rf.lastSnapshotTerm,
+		LastIncludedIndex: rf.lastSnapshotIndex,
+		Data: rf.persister.ReadSnapshot(),
+		LeaderId: rf.me,
+	}
+	reply := InstallSnapshotReply{}
+
+	rf.unlock("send sanpshot....")
+
+	ok := rf.peers[peeridx].Call("Raft.InstallSnapshot", &args, &reply)
+
+	if ok == true {
+		rf.lock("send sanpshot second....")
+
+		if reply.Term > rf.currentTerm{
+			rf.switchStatus_nolock(Follower)
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.electTimeout = randElectionTimeout()
+			rf.persist()
+
+			rf.unlock("send sanpshot second....")
+			return
+		}else {
+			if rf.matchIndex[peeridx] < args.LastIncludedIndex{
+				rf.matchIndex[peeridx]  = args.LastIncludedIndex
+				rf.nextIndex[peeridx]   = args.LastIncludedIndex + 1
+			}
+
+			rf.heartTimeout[peeridx] = randHeartBeatTimeout()
+
+			rf.unlock("send sanpshot second....")
+			return
+		}
+
+	}else {
+		return //如果失败了就不管
+	}
+}
+
+
+//TODO:修改index 和 term。 Installsnapshot RPC
+type InstallSnapshotArgs struct {
+	Term               int
+
+	LastIncludedIndex  int
+	LastIncludedTerm   int
+	LeaderId		   int
+	Data               []byte
+
+}
+
+type InstallSnapshotReply struct {
+	Term  int
+}
+
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.lock("Install Snapshot")
+	defer rf.unlock("Install Snapshot")
+	KVPrintf("Install Snapshot；%d",rf.me)
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm{
+		return
+	}else if args.Term > rf.currentTerm{
+		rf.switchStatus_nolock(Follower)
+		rf.votedFor = args.LeaderId
+		rf.currentTerm = args.Term
+	}
+
+	if args.LastIncludedIndex <= rf.lastSnapshotIndex{
+		return
+	}
+
+	newloghead := rf.getRealIdxByLogIndex(args.LastIncludedIndex)
+
+	if newloghead >= len(rf.logArray){ //全部日志将被覆盖
+		rf.logArray = make([]logEntry, 1)
+		rf.logArray[0].Term  = args.LastIncludedTerm
+		rf.logArray[0].Index = args.LastIncludedIndex
+	}else {
+		rf.logArray = rf.logArray[newloghead:]
+		rf.logArray[0].Term  = args.LastIncludedTerm
+		rf.logArray[0].Index = args.LastIncludedIndex
+	}
+	rf.lastSnapshotIndex = args.LastIncludedIndex
+	rf.lastSnapshotTerm  = args.LastIncludedTerm
+
+	//rf.commitIndex = args.LastIncludedIndex
+
+	DPrintf("follower:%d Install success.comitidx:%d,applididx:%d,lastsnapshot index:%d",rf.me,rf.commitIndex,rf.lastApplied,rf.lastSnapshotIndex)
+
+	rf.electTimeout = randElectionTimeout()
+	rf.persister.SaveStateAndSnapshot(rf.getPersistData(), args.Data)
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -795,7 +1063,8 @@ func (rf *Raft) Start(command interface{}) (index, term int , isLeader bool) {
 	defer rf.unlock("Start get command")
 
 	term = rf.currentTerm
-	index = len(rf.logArray)
+	//TODO:修改index 和 term，这里不对劲
+	index = len(rf.logArray) + rf.lastSnapshotIndex
 	isLeader = rf.peerstatus == Leader
 
 	if !isLeader {
@@ -868,7 +1137,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.logArray = make([]logEntry, 1)
 	rf.commitIndex = 0
-
+	rf.lastSnapshotIndex = 0
+	rf.lastSnapshotTerm  = 0
 
 	//2C
 	rf.readPersist(persister.ReadRaftState())
@@ -920,7 +1190,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i, _ := range rf.peers {
 
 		go func(peerindex int) {
-			sleepheartDura := HeartBeatTime / 10
+			sleepheartDura := HeartBeatTime / 20
 			for{
 				_, isLeader := rf.GetState()
 
@@ -947,27 +1217,52 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	go func() {
-		sleepforapply := ApplychTimeout / 10
+		sleepforapply := ApplychTimeout / 20
 		for {
 
 			rf.lock("read apply")
 			lastapplyid := rf.lastApplied
 			commitid    := rf.commitIndex
+			lastsnapshotindex := rf.lastSnapshotIndex
 			rf.unlock("read apply")
 
+			//TODO:修改index 和 term，这里得改，加一个判断啥时候给KV服务发送快照的逻辑。大刀阔斧
+			if lastapplyid < lastsnapshotindex{
+				rf.lock("read persist data")
+				msg := ApplyMsg{
+					CommandIndex: -1,
+					CommandValid: false,
+				}
+				rf.unlock("read persist data")
+
+				rf.applyCh <- msg
+
+				rf.lock("read data")
+				rf.lastApplied = lastsnapshotindex
+				rf.unlock("read data")
+
+				continue
+			}
 
 			if lastapplyid < commitid {
 				for ;lastapplyid < commitid; lastapplyid++{
 
 					rf.lock("read data")
+
+					if lastapplyid < rf.lastSnapshotIndex{
+						rf.unlock("read data")
+						break
+					}
+
 					//TODO：下面的数据只在这里被修改所以不用加锁，只是暂时不加锁
 					msg := ApplyMsg{
-						Command: rf.logArray[lastapplyid +1].Command, //这里out of range 了
+						Command: rf.logArray[rf.getRealIdxByLogIndex(lastapplyid +1)].Command, //这里out of range 了
 						CommandValid: true,
 						CommandIndex: lastapplyid + 1,
 					}
 
-					term := rf.logArray[lastapplyid+1].Term
+					term := rf.logArray[rf.getRealIdxByLogIndex(lastapplyid +1)].Term
+
 					DPrintf("server:%d, send commnd, index: %d, term: %d. NOW is term:%d",rf.me,lastapplyid + 1,term,rf.currentTerm)
 
 					rf.unlock("read data")
@@ -978,8 +1273,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.lock("read data")
 					rf.lastApplied = lastapplyid + 1
 					rf.unlock("read data")
-
-
 				}
 			}else {
 				time.Sleep(sleepforapply)
