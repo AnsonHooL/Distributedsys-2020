@@ -33,55 +33,59 @@ Lab3A(√)
 
 Lab3B(√)
 
-```C
+```c++
 Test: one client (3A) ...
-  ... Passed --  15.1  5  6228 1249
+  ... Passed --  15.1  5  6220 1234
 Test: many clients (3A) ...
-  ... Passed --  15.3  5  6681 2835
+  ... Passed --  15.4  5  6770 2931
 Test: unreliable net, many clients (3A) ...
-  ... Passed --  16.4  5  5585  974
+  ... Passed --  16.8  5  5817 1064
 Test: concurrent append to same key, unreliable (3A) ...
-  ... Passed --   1.1  3   180   52
+  ... Passed --   1.3  3   175   52
 Test: progress in majority (3A) ...
-  ... Passed --   0.4  5    34    2
+  ... Passed --   0.4  5    37    2
 Test: no progress in minority (3A) ...
-  ... Passed --   1.0  5   114    3
+  ... Passed --   1.0  5   106    3
 Test: completion after heal (3A) ...
-  ... Passed --   1.1  5    49    3
+  ... Passed --   1.1  5    44    3
 Test: partitions, one client (3A) ...
-  ... Passed --  22.5  5  6178 1087
+  ... Passed --  22.5  5  6539 1182
 Test: partitions, many clients (3A) ...
-  ... Passed --  23.0  5  7881 3014
+  ... Passed --  22.7  5  7705 2714
 Test: restarts, one client (3A) ...
-  ... Passed --  19.5  5  6354 1255
+  ... Passed --  19.7  5  6454 1265
 Test: restarts, many clients (3A) ...
-  ... Passed --  19.7  5  7384 2970
+  ... Passed --  20.2  5  7492 2989
 Test: unreliable net, restarts, many clients (3A) ...
-  ... Passed --  21.7  5  6287 1021
+  ... Passed --  20.8  5  6265 1036
 Test: restarts, partitions, many clients (3A) ...
-  ... Passed --  27.3  5  7751 2847
+  ... Passed --  27.6  5  8008 2862
 Test: unreliable net, restarts, partitions, many clients (3A) ...
-  ... Passed --  29.6  5  6003  793
+  ... Passed --  28.8  5  5691  704
 Test: unreliable net, restarts, partitions, many clients, linearizability checks (3A) ...
-  ... Passed --  25.1  7 14541 1598
+  ... Passed --  25.6  7 14546 1517
 Test: InstallSnapshot RPC (3B) ...
-  ... Passed --   3.1  3   278   63
+  ... Passed --   2.8  3   275   63
 Test: snapshot size is reasonable (3B) ...
-  ... Passed --   6.5  3  2421  800
+  ... Passed --   6.6  3  2430  800
 Test: restarts, snapshots, one client (3B) ...
-  ... Passed --  20.3  5  9706 1890
+  ... Passed --  20.7  5  9743 1891
 Test: restarts, snapshots, many clients (3B) ...
-  ... Passed --  20.2  5 29448 18722
+  ... Passed --  20.0  5 30771 20209
 Test: unreliable net, snapshots, many clients (3B) ...
-  ... Passed --  17.3  5  5795 1015
+  ... Passed --  16.8  5  5752 1039
 Test: unreliable net, restarts, snapshots, many clients (3B) ...
-  ... Passed --  21.2  5  6610 1124
+  ... Passed --  20.9  5  6340 1065
 Test: unreliable net, restarts, partitions, snapshots, many clients (3B) ...
-  ... Passed --  29.9  5  5930  792
+  ... Passed --  28.6  5  6010  839
 Test: unreliable net, restarts, partitions, snapshots, many clients, linearizability checks (3B) ...
-  ... Passed --  25.5  7 15882 1835
+  ... Passed --  25.6  7 14706 1515
 PASS
-ok  	_/home/thl/MIT-6.824-skeleton/src/kvraft	143.999s
+ok  	_/home/thl/MIT-6.824-skeleton/src/kvraft	381.930s
+
+real	6m22.367s
+user	6m17.696s
+sys 	0m47.163s
 ```
 
 

@@ -12,7 +12,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-const KVDebug = 0
+const KVDebug = 1
 
 func KVPrintf(format string, a ...interface{}) (n int, err error) {
 	if KVDebug > 0 {

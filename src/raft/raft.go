@@ -944,6 +944,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendSnapshot(peeridx int){
 	rf.lock("send sanpshot....")
+
+	if rf.peerstatus != Leader{
+		rf.unlock("send sanpshot....")
+		return
+	}
+
 	args := InstallSnapshotArgs{
 		Term: rf.currentTerm,
 		LastIncludedTerm:  rf.lastSnapshotTerm,
@@ -1012,13 +1018,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Term < rf.currentTerm{
 		return
-	}else if args.Term > rf.currentTerm{
+	}else if args.Term > rf.currentTerm || rf.peerstatus != Follower{
 		rf.switchStatus_nolock(Follower)
 		rf.votedFor = args.LeaderId
 		rf.currentTerm = args.Term
 	}
 
 	if args.LastIncludedIndex <= rf.lastSnapshotIndex{
+		rf.persist()
 		return
 	}
 
@@ -1215,7 +1222,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	}
 
-
 	go func() {
 		sleepforapply := ApplychTimeout / 20
 		for {
@@ -1224,11 +1230,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			lastapplyid := rf.lastApplied
 			commitid    := rf.commitIndex
 			lastsnapshotindex := rf.lastSnapshotIndex
-			rf.unlock("read apply")
 
 			//TODO:修改index 和 term，这里得改，加一个判断啥时候给KV服务发送快照的逻辑。大刀阔斧
 			if lastapplyid < lastsnapshotindex{
-				rf.lock("read persist data")
 				msg := ApplyMsg{
 					CommandIndex: -1,
 					CommandValid: false,
@@ -1240,41 +1244,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.lock("read data")
 				rf.lastApplied = lastsnapshotindex
 				rf.unlock("read data")
-
 				continue
 			}
 
 			if lastapplyid < commitid {
+				msgs := make([]ApplyMsg, 0, commitid - lastapplyid)
+
 				for ;lastapplyid < commitid; lastapplyid++{
-
-					rf.lock("read data")
-
-					if lastapplyid < rf.lastSnapshotIndex{
-						rf.unlock("read data")
-						break
-					}
-
-					//TODO：下面的数据只在这里被修改所以不用加锁，只是暂时不加锁
 					msg := ApplyMsg{
 						Command: rf.logArray[rf.getRealIdxByLogIndex(lastapplyid +1)].Command, //这里out of range 了
 						CommandValid: true,
 						CommandIndex: lastapplyid + 1,
 					}
-
+					msgs = append(msgs, msg)
 					term := rf.logArray[rf.getRealIdxByLogIndex(lastapplyid +1)].Term
-
 					DPrintf("server:%d, send commnd, index: %d, term: %d. NOW is term:%d",rf.me,lastapplyid + 1,term,rf.currentTerm)
-
-					rf.unlock("read data")
-
 					KVPrintf("send a msg to KVserver")
-					rf.applyCh <- msg
-
-					rf.lock("read data")
-					rf.lastApplied = lastapplyid + 1
-					rf.unlock("read data")
 				}
+
+				rf.unlock("read apply")
+
+				for _, msg := range msgs{
+					rf.applyCh <- msg
+					rf.lock("applyLogs2")
+					rf.lastApplied = msg.CommandIndex
+					rf.unlock("applyLogs2")
+				}
+
 			}else {
+				rf.unlock("read apply")
 				time.Sleep(sleepforapply)
 				if rf.killed(){
 					return
@@ -1282,6 +1280,74 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 		}
 	}()
+
+	//go func() {
+	//	sleepforapply := ApplychTimeout / 20
+	//	for {
+	//
+	//		rf.lock("read apply")
+	//		lastapplyid := rf.lastApplied
+	//		commitid    := rf.commitIndex
+	//		lastsnapshotindex := rf.lastSnapshotIndex
+	//
+	//		rf.unlock("read apply")
+	//
+	//		//TODO:修改index 和 term，这里得改，加一个判断啥时候给KV服务发送快照的逻辑。大刀阔斧
+	//		if lastapplyid < lastsnapshotindex{
+	//			rf.lock("read persist data")
+	//			msg := ApplyMsg{
+	//				CommandIndex: -1,
+	//				CommandValid: false,
+	//			}
+	//			rf.unlock("read persist data")
+	//
+	//			rf.applyCh <- msg
+	//
+	//			rf.lock("read data")
+	//			rf.lastApplied = lastsnapshotindex
+	//			rf.unlock("read data")
+	//
+	//			continue
+	//		}
+	//
+	//		if lastapplyid < commitid {
+	//			for ;lastapplyid < commitid; lastapplyid++{
+	//
+	//				rf.lock("read data")
+	//
+	//				if lastapplyid < rf.lastSnapshotIndex{
+	//					rf.unlock("read data")
+	//					break
+	//				}
+	//
+	//				//TODO：下面的数据只在这里被修改所以不用加锁，只是暂时不加锁
+	//				msg := ApplyMsg{
+	//					Command: rf.logArray[rf.getRealIdxByLogIndex(lastapplyid +1)].Command, //这里out of range 了
+	//					CommandValid: true,
+	//					CommandIndex: lastapplyid + 1,
+	//				}
+	//
+	//				term := rf.logArray[rf.getRealIdxByLogIndex(lastapplyid +1)].Term
+	//
+	//				DPrintf("server:%d, send commnd, index: %d, term: %d. NOW is term:%d",rf.me,lastapplyid + 1,term,rf.currentTerm)
+	//
+	//				rf.unlock("read data")
+	//
+	//				KVPrintf("send a msg to KVserver")
+	//				rf.applyCh <- msg
+	//
+	//				rf.lock("read data")
+	//				rf.lastApplied = lastapplyid + 1
+	//				rf.unlock("read data")
+	//			}
+	//		}else {
+	//			time.Sleep(sleepforapply)
+	//			if rf.killed(){
+	//				return
+	//			}
+	//		}
+	//	}
+	//}()
 
 	// initialize from state persisted before a crash
 

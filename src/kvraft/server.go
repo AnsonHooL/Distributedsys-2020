@@ -15,13 +15,13 @@ import (
 
 const(
 	MaxLockTime        time.Duration = 10  * time.Millisecond
-	MaxWaitopTime	   time.Duration = 100 * time.Millisecond
+	MaxWaitopTime	   time.Duration = 200 * time.Millisecond
 	ChangeLeaderTime   time.Duration = 20  * time.Millisecond
 )
 
 
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -355,12 +355,14 @@ func (kv *KVServer) waitapply(){
 					kv.applyHistory[clientid] = opid
 					kv.resultCache[clientid]  = result
 					kv.unlock("read state machine")
+
 				}else {
 					kv.unlock("read state machine")
 					continue
 				}
 
 				msgindex := msg.CommandIndex
+
 				kv.lock("save snap")
 				kv.savesnapshot(msgindex)
 				kv.unlock("save snap")
