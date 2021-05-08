@@ -90,7 +90,7 @@ type KVServer struct {
 func (kv *KVServer) waitopreply(op Op)(re ClerkResult){
 	index,term,isLeader := kv.rf.Start(op)
 
-	DPrintf("wait an op:%v,index:%d,term:%d",op.Method,index,term)
+	DPrintf("server:%d, wait an op:%v,index:%d,term:%d.clinet id:%d,segid:%d",kv.me,op.Method,index,term,op.ClientId,op.SeqcmdID)
 
 	if !isLeader{
 		re.Error = ErrWrongLeader
@@ -244,7 +244,7 @@ func (kv *KVServer) readPersist(data []byte){
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-
+	DPrintf("read Persist a kvserver:%d.", kv.me)
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
@@ -327,13 +327,28 @@ func (kv *KVServer) waitapply(){
 				clientid := op.ClientId
 				opid     := op.SeqcmdID
 
-				DPrintf("get apply clinet id:%d seq id%d", clientid, opid)
 				kv.lock("read state machine")
+
+				DPrintf("server:%d,get apply clinet id:%d seq id%d, kv.applyHistory[clientid]:%d.\nmsgidx:%d", kv.me ,clientid, opid, kv.applyHistory[clientid],
+					msg.CommandIndex)
+
 				if kv.applyHistory[clientid] == opid{
 					//重复的命令
 					kv.unlock("read state machine")
 					continue
 				}else if kv.applyHistory[clientid] < opid{ //状态机只会被这里修改.  来的是新的命令
+
+					_,ok := kv.applyHistory[clientid]
+					DPrintf("server:%d, key in map:%v,", kv.me, ok)
+
+					if kv.applyHistory[clientid] + 1 != opid{
+						_,ok := kv.applyHistory[clientid]
+
+						DPrintf("apply fail!!! server:%d, kv.applyHistory[clientid]:%d.key in map:%v",kv.me, kv.applyHistory[clientid],ok)
+
+					}
+
+
 					result   := ClerkResult{
 						Cmdseqid: opid,
 					}
@@ -397,7 +412,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.applyCh = make(chan raft.ApplyMsg)
-
+	DPrintf("Make a kvserver:%d.", kv.me)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.persister = persister

@@ -19,11 +19,9 @@ Lab2C(√)
 
 2021/04/22：
 
-批量测试了2000次均通过，正确性应该没问题，下面是测试结果 : )
+批量测试了2000次均通过，正确性应该没问题 (结果在doc文件夹里)
 
 脚本位置在src/ratf/go-test-many.sh中，是6.824助教提供的。
-
-![lab2测试](https://github.com/AnsonHooL/Distributedsys-2020/blob/kvstore1.0/src/doc/lab2%E6%B5%8B%E8%AF%95.jpg)
 
 2021/04/24：
 
@@ -88,10 +86,16 @@ user	6m17.696s
 sys 	0m47.163s
 ```
 
+2021/05/08 ：
+
+修复lab3B的bug，raft持久化恢复时，应该先初始化数据，再读persistent，但是我先读了persistent，再初始化第0个位置的日志，使得错误的结点当选Leader。
+
+3B跑了200次，单个TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B跑了1000次
 
 
 
+TODO：
 
-#### TODO:
+lab4
 
-Lab3B有平均500次出现的一次BUG，暂时没想法修复 ~
+Challenge

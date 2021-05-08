@@ -358,20 +358,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.currentTerm > args.Term{ //过期RPC
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+		DPrintf("old rpc,vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
 		return
 	}else if rf.currentTerm == args.Term{
 		if rf.peerstatus == Leader || rf.peerstatus == Candidate{
 			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
-			DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+			DPrintf("not follower.vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
 			return
 		}else { //follower
 			if rf.votedFor == args.CandidateID {  //之前投的票RPC有可能丢失 或者 在这一轮没有投票
 				reply.Term = rf.currentTerm
 				reply.VoteGranted = true
 				rf.electTimeout = randElectionTimeout() ///重新定时,注意这里一定要正确的重置，否则选举很容易活锁【坑坑坑】
-				DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+				DPrintf("revote vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
 				return
 			} else if rf.votedFor == -1 { //还没投票呢
 				mylastlogterm,mylastlogindex := rf.lastLogTermIndex()
@@ -381,6 +381,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					rf.electTimeout = randElectionTimeout() ///重新定时
 					rf.votedFor = args.CandidateID //这句我一开始居然忘记写了。。。差点出大问题，坑啊
 					DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+					DPrintf("[canditate:%d][me:%d][can lasterm:%d][can lastindex:%d][me lasterm:%d][me lastindex:%d][vote:%v]",args.CandidateID,rf.me,args.LastLogTerm,
+						args.LastLogIndex,mylastlogterm,mylastlogindex,reply.VoteGranted)
 					rf.persist()
 					return
 				}
@@ -388,7 +390,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			 //票投给了其他人
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
-			DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
+			//DPrintf("vote:%v %d-->%d",reply.VoteGranted, rf.me, args.CandidateID)
 			return
 		}
 	}else { //RPC的任期比当前节点大,因此进行投票给他，不考虑发送日志情况下,现在要考虑了！！！！【坑，忘记改了lab2b】
@@ -402,9 +404,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			rf.electTimeout = randElectionTimeout() ///重新定时
 			reply.VoteGranted = true
+			DPrintf("[canditate:%d][me:%d][can lasterm:%d][can lastindex:%d][me lasterm][me lastindex][vote:%v]",args.CandidateID,rf.me,args.LastLogTerm,
+				args.LastLogIndex,mylastlogterm,mylastlogindex,reply.VoteGranted)
 		}else {
 			rf.votedFor = -1
 			reply.VoteGranted = false
+			DPrintf("[canditate:%d][me:%d][can lasterm:%d][can lastindex:%d][me lasterm][me lastindex][vote:%v]",args.CandidateID,rf.me,args.LastLogTerm,
+				args.LastLogIndex,mylastlogterm,mylastlogindex,reply.VoteGranted)
 		}
 
 		rf.persist()
@@ -593,7 +599,7 @@ func (rf *Raft) sendHeartBeattopeer(peerindex int, peer *labrpc.ClientEnd){
 	rf.lock("")
 
 	rf.HeartRPC++
-	DPrintf("server:%d,Append time:%d",rf.me,rf.HeartRPC)
+	//DPrintf("server:%d,Append time:%d",rf.me,rf.HeartRPC)
 	rf.unlock("")
 
 
@@ -1029,6 +1035,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+
 	newloghead := rf.getRealIdxByLogIndex(args.LastIncludedIndex)
 
 	if newloghead >= len(rf.logArray){ //全部日志将被覆盖
@@ -1045,7 +1052,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	//rf.commitIndex = args.LastIncludedIndex
 
-	DPrintf("follower:%d Install success.comitidx:%d,applididx:%d,lastsnapshot index:%d",rf.me,rf.commitIndex,rf.lastApplied,rf.lastSnapshotIndex)
+	KVPrintf("follower:%d Install success.comitidx:%d,applididx:%d,lastsnapshot index:%d",rf.me,rf.commitIndex,rf.lastApplied,rf.lastSnapshotIndex)
 
 	rf.electTimeout = randElectionTimeout()
 	rf.persister.SaveStateAndSnapshot(rf.getPersistData(), args.Data)
@@ -1147,6 +1154,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastSnapshotIndex = 0
 	rf.lastSnapshotTerm  = 0
 
+	//下面这两行没放在上面一开始，害我排查了好久哦【坑】
+	rf.logArray[0] = logEntry{
+		Term: 0,
+		Index: 0,
+	}
+
+
 	//2C
 	rf.readPersist(persister.ReadRaftState())
 
@@ -1159,10 +1173,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.heartTimeout = make([]time.Time, len(peers))
 
-	rf.logArray[0] = logEntry{
-		Term: 0,
-		Index: 0,
-	}
+
 
 
 
